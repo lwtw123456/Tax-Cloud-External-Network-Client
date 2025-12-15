@@ -58,8 +58,16 @@ class RequestClient:
     def safe_request(self, method, url, **kwargs):
         try:
             resp = self.session.request(method, url, timeout=5, **kwargs)
-            if not hasattr(resp, "json"):
-                resp.json = lambda: {}
+            
+            _raw_json = resp.json
+
+            def _safe_json():
+                try:
+                    return _raw_json()
+                except Exception:
+                    return {}
+            resp.json = _safe_json
+
             return resp
         except Exception as e:
             if self.error_handler:
@@ -67,10 +75,12 @@ class RequestClient:
             return type(
                 "Resp",
                 (object,),
-                {"status_code": 500, 
-                "json": staticmethod(lambda: {}), 
-                "content": b"",
-                "iter_content": staticmethod(lambda chunk_size=8192: [])},
+                {
+                    "status_code": 500,
+                    "json": staticmethod(lambda: {}),
+                    "content": b"",
+                    "iter_content": staticmethod(lambda chunk_size=8192: []),
+                },
             )()
 
     def resolve_code(self, code_value):
@@ -447,7 +457,7 @@ class App(TkinterDnD.Tk):
         short = message if len(message) < 80 else message[:77] + "..."
         self.lbl_status.config(text=short)
 
-    def _on_request_error(self, exception: Exception, url: str):
+    def _on_request_error(self, exception, url):
         msg = f"网络请求异常：{exception} - {url}"
         self.append_log(msg)
 
@@ -476,22 +486,14 @@ class App(TkinterDnD.Tk):
                 if idle_seconds is not None and idle_seconds > self.idle_threshold:
                     if not self._idle_logged:
                         self._idle_logged = True
-                        self.after(
-                            0,
-                            lambda: self.append_log(
-                                f"[监控] 检测到用户已空闲超过 {self.idle_threshold} 秒，暂停验证码轮询。"
-                            ),
-                        )
+                        self.after(0, lambda: self.append_log(f"[监控] 检测到用户已空闲超过 {self.idle_threshold} 秒，暂停验证码轮询。"))
                     if self.stop_event.wait(1):
                         break
                     continue
                 else:
                     if self._idle_logged:
                         self._idle_logged = False
-                        self.after(
-                            0,
-                            lambda: self.append_log("[监控] 检测到用户恢复活动，恢复验证码轮询。"),
-                        )
+                        self.after(0, lambda: self.append_log("[监控] 检测到用户恢复活动，恢复验证码轮询。"))
 
                 result = self.check_code(code_value)
                 if not result:
@@ -526,7 +528,6 @@ class App(TkinterDnD.Tk):
                     return False
         else:
             self.after(0, lambda: self.append_log("[验证] 失败！服务器故障或服务器地址错误。"))
-            return False
         return True
 
     def stop_monitor(self):
@@ -554,8 +555,8 @@ class App(TkinterDnD.Tk):
         return resp, file_name
 
     def _upload_async_core(self, file_path=None):
-        self.btn_confirm.config(state="disabled")
-        self.btn_download.config(state="disabled")
+        self.after(0, self.btn_confirm.config(state="disabled"))
+        self.after(0, self.btn_download.config(state="disabled"))
 
         def _next_name(name, n):
             base, ext = os.path.splitext(name)
@@ -579,11 +580,17 @@ class App(TkinterDnD.Tk):
             msg = None
             if resp.status_code == 200:
                 json_data = resp.json()
-                if not json_data.get("success"):
+                if json_data.get('success'):
+                    self.append_log(f"[上传] 成功，文件名为「{file_name}」")
+                else:
                     msg = json_data.get("msg")
                     if msg == "中转上传文件中已存在同名文件":
                         attempt += 1
                         need_retry = True
+                    else:
+                        self.append_log(f"[上传] 失败，{msg}。")
+            else:
+                self.append_log(f"[上传] 失败！服务器故障或服务器地址错误。")
 
             if need_retry:
                 self.after(0, lambda fn=file_name: self.append_log(f"[上传] 检测到同名，自动更名后重试：{fn}"))
@@ -591,23 +598,8 @@ class App(TkinterDnD.Tk):
 
             break
 
-        def ui_update():
-            self.btn_confirm.config(state="normal")
-            self.btn_download.config(state="normal")
-
-            if resp.status_code == 200:
-                json_data = resp.json()
-                if json_data.get('success'):
-                    self.append_log(f"[上传] 成功，文件名为「{file_name}」")
-                else:
-                    msg2 = json_data.get('msg')
-                    self.append_log(f"[上传] 失败，{msg2}。")
-                    if msg2 != "中转上传文件中已存在同名文件":
-                        self.stop_monitor()
-            else:
-                self.append_log(f"[上传] 失败！服务器故障或服务器地址错误。")
-
-        self.after(0, ui_update)
+        self.after(0, self.btn_confirm.config(state="normal"))
+        self.after(0, self.btn_download.config(state="normal"))
 
     def upload_async(self, file_path=None):
         run_async(self._upload_async_core, file_path)
