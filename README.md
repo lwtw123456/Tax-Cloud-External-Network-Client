@@ -1,6 +1,6 @@
 # 税务云文件中转客户端
 
-![image](screenshots/main_page.png)
+![image](screenshots/main_page_v1.0.0.png)
 
 ------------------------------------------------------------------------
 
