@@ -1,38 +1,20 @@
 # -*- coding: utf-8 -*-
-"""
-文件名称: main.py
-项目说明: 税务云文件中转客户端
-功能描述:
-    本程序为税务云的外网桌面客户端工具，
-    实现文本上传、文件拖拽上传与文件下载功能。界面基于 ttkbootstrap 构建，
-    网络请求基于 requests 实现，支持异常捕获、日志记录及线程安全的 UI 更新。
-
-作者说明:
-    本代码采用企业级结构设计，遵循“网络层与界面层解耦”原则，
-    适用于中小型 Python GUI 项目的开发与维护示范。
-
-修改记录:
-    2025-12-04  初始版本
-
-注意事项:
-    1. 本程序需在税务外网运行。
-    2. 建议在 Python 3.8+ 环境执行。
-"""
 
 import os
 import sys
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 from tkinterdnd2 import DND_FILES, TkinterDnD
+from ttkbootstrap.icons import Icon
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 from io import BytesIO
-import threading
-import time
+from threading import Event
 import mimetypes
 import requests
 from datetime import datetime
 import configparser
+from utils import is_valid_host, get_filename_suffix, run_async, get_idle_seconds, decode_response_content
 
 # ============================
 # 网络请求客户端（网络访问层）
@@ -42,6 +24,7 @@ class RequestClient:
     
     def __init__(self, error_handler=None):
         self.error_handler = error_handler
+        self.session = requests.Session()
 
     def _build_base_urls(self):
         base = f"http://{self.HOST}/cloudcenter/conversionNew"
@@ -71,11 +54,10 @@ class RequestClient:
         if content_type:
             headers["content-type"] = "application/x-www-form-urlencoded; charset=UTF-8"
         return headers
-
-        # 统一的 requests 请求封装入口，避免异常导致程序崩溃
+            
     def safe_request(self, method, url, **kwargs):
         try:
-            resp = requests.request(method, url, timeout=10, **kwargs)
+            resp = self.session.request(method, url, timeout=5, **kwargs)
             if not hasattr(resp, "json"):
                 resp.json = lambda: {}
             return resp
@@ -85,7 +67,10 @@ class RequestClient:
             return type(
                 "Resp",
                 (object,),
-                {"status_code": 500, "json": staticmethod(lambda: {}), "content": b""},
+                {"status_code": 500, 
+                "json": staticmethod(lambda: {}), 
+                "content": b"",
+                "iter_content": staticmethod(lambda chunk_size=8192: [])},
             )()
 
     def resolve_code(self, code_value):
@@ -120,7 +105,7 @@ class RequestClient:
 
     def get_file_list(self, code_value):
         urls = self._build_base_urls()
-        params = {"code": code_value, "order": "ctime", "asc": "desc", "_": int(time.time() * 1000)}
+        params = {"code": code_value, "order": "ctime", "asc": "desc", "_": int(datetime.now().timestamp() * 1000)}
         return self.safe_request(
             "get", urls["file_list"], params=params, cookies=self._build_cookies(), headers=self._build_headers(x_requested=True)
         )
@@ -133,7 +118,75 @@ class RequestClient:
             data={"fileIds": file_ids},
             cookies=self._build_cookies(),
             headers=self._build_headers(content_type=True),
+            stream=True,
         )
+
+
+# ============================
+# 配置与持久化
+# ============================
+class ConfigManager:
+    def __init__(self, config_path: str, logger=None):
+        self.config_path = config_path
+        self._config = configparser.ConfigParser()
+        self.logger = logger
+
+    def _log(self, msg: str):
+        if self.logger:
+            self.logger(msg)
+
+    def _ensure_sections(self):
+        if not self._config.has_section("server"):
+            self._config.add_section("server")
+        if not self._config.has_section("session"):
+            self._config.add_section("session")
+
+    def load_all(self) -> dict:
+        result = {"host": "", "code": ""}
+        if not os.path.exists(self.config_path):
+            return result
+
+        try:
+            self._config.read(self.config_path, encoding="utf-8")
+            result["host"] = self._config.get("server", "host", fallback="").strip()
+            result["code"] = self._config.get("session", "code", fallback="").strip()
+        except Exception as e:
+            self._log(f"[配置] 读取配置文件时发生错误：{e}")
+        return result
+
+    def save(self, host: str = None, code: str = None):
+        if os.path.exists(self.config_path) and not self._config.sections():
+            try:
+                self._config.read(self.config_path, encoding="utf-8")
+            except Exception:
+
+                self._config = configparser.ConfigParser()
+
+        self._ensure_sections()
+
+        if host is not None:
+            self._config.set("server", "host", host)
+        if code is not None:
+            self._config.set("session", "code", code)
+
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                self._config.write(f)
+            if host is not None:
+                self._log(f"[配置] 已保存服务器地址到配置文件：{self.config_path}")
+            if code is not None:
+                if code:
+                    self._log("[配置] 已保存验证码到配置文件")
+                else:
+                    self._log("[配置] 已清空已保存的验证码")
+        except Exception as e:
+            self._log(f"[配置] 保存配置文件失败：{e}")
+
+    def save_host(self, host: str):
+        self.save(host=host)
+
+    def save_code(self, code: str):
+        self.save(code=code)
 
 # ============================
 # 主窗口类（界面与业务逻辑层）
@@ -145,40 +198,29 @@ class App(TkinterDnD.Tk):
         super().__init__()
         self.style = tb.Style("flatly")
         self.title(self.BASE_TITLE)
+        self.iconphoto(True, tk.PhotoImage(data=Icon.icon))
         width, height = 1100, 750
         screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
         x, y = (screen_w - width) // 2, (screen_h - height) // 2
         self.geometry(f"{width}x{height}+{x}+{y}")
 
-        # 配置文件路径（与 main.py 同目录）
-        self.config_path = os.path.join(
-            sys.path[0],
-            "config.ini",
-        )
-
         self.client = RequestClient(self._on_request_error)
-
-        # 尝试从配置文件中读取 HOST
-        host = self._load_host_from_config()
-        if host:
-            self.client.HOST = host
-
+        config_path = os.path.join(sys.path[0], "config.ini")
+        self.config_manager = ConfigManager(config_path, logger=self.append_log)
+        
         self.locked = True
         self.monitor_thread_started = False
-        self.stop_event = threading.Event()
-        self.current_code = ""  # store current verified code
+        self.stop_event = Event()
+        self.current_code = ""
+
+        self.idle_threshold = 60
+        self._idle_logged = False
 
         self._build_ui()
         self.set_locked(True)
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self._init_from_config()
 
-        # 根据是否已读取到 HOST 给出提示 / 弹窗
-        if host:
-            self.append_log(f"[配置] 已从配置文件读取服务器地址：{host}")
-        else:
-            self.append_log("[配置] 未检测到服务器地址(HOST)，请先点击“配置地址”进行设置。")
-            self.after(200, lambda: self.show_host_config(reason="startup"))
-
-        # 构建整个 GUI 界面布局
     def _build_ui(self):
         container = tb.Frame(self, padding=12)
         container.pack(fill=BOTH, expand=True)
@@ -248,47 +290,49 @@ class App(TkinterDnD.Tk):
 
         self.append_log("[启动] 界面加载完成，如首次使用请先点击“配置地址”设置 HOST，然后输入验证码并点击“确定”。")
 
-    # ============================
-    # 配置文件读取 / 保存（HOST）
-    # ============================
-    def _load_host_from_config(self) -> str:
-        cfg = configparser.ConfigParser()
-        if not os.path.exists(self.config_path):
-            return ""
-        try:
-            cfg.read(self.config_path, encoding="utf-8")
-            host = cfg.get("server", "host", fallback="").strip()
-            return host
-        except Exception:
-            return ""
+    def _on_closing(self):
+        if not self.locked and self.current_code:
+            self.config_manager.save_code(self.current_code)
+        else:
+            self.config_manager.save_code("")
 
-    def _save_host_to_config(self, host: str):
-        cfg = configparser.ConfigParser()
-        cfg["server"] = {"host": host}
-        try:
-            with open(self.config_path, "w", encoding="utf-8") as f:
-                cfg.write(f)
-            self.append_log(f"[配置] 已保存服务器地址到配置文件：{self.config_path}")
-        except Exception as e:
-            self.append_log(f"[配置] 保存配置文件失败：{e}")
+        self.stop_event.set()
+        self.destroy()
 
     def _is_host_configured(self) -> bool:
         return bool(getattr(self.client, "HOST", "").strip())
 
-    def ensure_host_configured(self, auto_popup: bool = True) -> bool:
+    def _init_from_config(self):
+        config = self.config_manager.load_all()
+        host = config.get("host", "")
+        saved_code = config.get("code", "")
+
+        if not host:
+            self.append_log("[配置] 未检测到服务器地址(HOST)，请先点击“配置地址”进行设置。")
+            self.after(200, lambda: self.show_host_config(reason="startup"))
+            return
+
+        self.client.HOST = host
+        self.append_log(f"[配置] 已从配置文件读取服务器地址：{host}")
+
+        if saved_code and len(saved_code) == 6 and saved_code.isdigit():
+            self.entry_code.delete(0, 'end')
+            self.entry_code.insert(0, saved_code)
+            self.append_log("[配置] 已从配置文件读取上次的验证码，正在自动验证...")
+            self.after(100, self.on_unlock_clicked)
+
+    def ensure_host_configured(self, auto_popup ):
         if self._is_host_configured():
             return True
-        self.append_log("[配置] 尚未配置服务器地址(HOST)，请先完成服务器配置。")
+        self.append_log("[配置] 未检测到服务器地址(HOST)，请先点击“配置地址”进行设置。")
         if auto_popup:
             self.after(0, lambda: self.show_host_config(reason="runtime"))
         return False
 
     def show_host_config(self, reason: str = "manual"):
         win = tb.Toplevel(self)
+        win.withdraw()
         win.title("配置服务器地址 (HOST)")
-        win.transient(self)
-        win.grab_set()
-
         self.update_idletasks()
         width, height = 420, 220
         parent_x, parent_y = self.winfo_x(), self.winfo_y()
@@ -331,7 +375,7 @@ class App(TkinterDnD.Tk):
 
         lbl_example = tb.Label(
             frame,
-            text="示例：192.168.1.1",
+            text="示例：192.168.1.1 或 example.com",
             bootstyle="secondary",
             anchor="w",
             justify="left",
@@ -341,53 +385,18 @@ class App(TkinterDnD.Tk):
         btn_frame = tb.Frame(frame)
         btn_frame.pack(fill=X, pady=(4, 0))
 
-        def is_valid_ip(host):
-            if ':' in host:
-                parts = host.split(':')
-                if len(parts) != 2:
-                    return False
-                
-                ip_part, port_part = parts
-
-                if not port_part.isdigit() or not (0 <= int(port_part) <= 65535):
-                    return False
-            else:
-                ip_part = host
-            
-            ip_segments = ip_part.split('.')
-            if len(ip_segments) != 4:
-                return False
-            
-            for segment in ip_segments:
-                if not segment.isdigit():
-                    return False
-                
-                num = int(segment)
-                if not (0 <= num <= 255):
-                    return False
-                
-                if segment != str(num):
-                    return False
-
-            return True
-
         def on_save():
             host = entry_host.get().strip()
             if not host:
                 messagebox.showwarning("配置服务器地址", "服务器地址不能为空，请输入一个有效的 HOST。")
                 return
-            if host.lower().startswith("http://"):
-                host = host[7:]
-            elif host.lower().startswith("https://"):
-                host = host[8:]
-            host = host.rstrip("/")
 
-            if not is_valid_ip(host):
+            if not is_valid_host(host):
                 messagebox.showwarning("配置服务器地址", "服务器地址格式不正确，请重新输入。")
                 return
 
             self.client.HOST = host
-            self._save_host_to_config(host)
+            self.config_manager.save_host(host)
             self.append_log(f"[配置] 已设置服务器地址：{host}")
             win.destroy()
 
@@ -401,6 +410,7 @@ class App(TkinterDnD.Tk):
 
         btn_cancel = tb.Button(btn_frame, text="取消", bootstyle=SECONDARY, command=on_cancel)
         btn_cancel.pack(side=RIGHT)
+        self.show_modal(win)
 
     def _validate_code(self, new_value: str) -> bool:
         if len(new_value) > 6:
@@ -428,7 +438,6 @@ class App(TkinterDnD.Tk):
         else:
             self.drop_area.config(text="将文件拖拽到此处（支持多个）", bootstyle="info-subtle")
 
-        # 统一日志输出函数（含时间戳 + 状态栏同步）
     def append_log(self, message: str):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.text_log.configure(state="normal")
@@ -442,7 +451,6 @@ class App(TkinterDnD.Tk):
         msg = f"网络请求异常：{exception} - {url}"
         self.append_log(msg)
 
-        # 处理“确定/验证验证码”按钮点击事件
     def on_unlock_clicked(self):
         if not self.ensure_host_configured(auto_popup=True):
             return
@@ -454,23 +462,45 @@ class App(TkinterDnD.Tk):
         if not self.monitor_thread_started:
             self.monitor_thread_started = True
             self.stop_event.clear()
-            t = threading.Thread(target=self._monitor_check_loop, args=(code_value,), daemon=True)
-            t.start()
+            run_async(self._monitor_check_loop, code_value)
             self.append_log("[验证] 已开始轮询验证。")
         else:
             self.append_log("[验证] 已在轮询中。")
 
     def _monitor_check_loop(self, code_value):
         self.current_code = code_value
-        while not self.stop_event.is_set():
-            result = self.check_code(code_value)
-            if not result:
-                break
-            for _ in range(60):
-                if self.stop_event.is_set():
+        try:
+            while not self.stop_event.is_set():
+                idle_seconds = get_idle_seconds()
+
+                if idle_seconds is not None and idle_seconds > self.idle_threshold:
+                    if not self._idle_logged:
+                        self._idle_logged = True
+                        self.after(
+                            0,
+                            lambda: self.append_log(
+                                f"[监控] 检测到用户已空闲超过 {self.idle_threshold} 秒，暂停验证码轮询。"
+                            ),
+                        )
+                    if self.stop_event.wait(1):
+                        break
+                    continue
+                else:
+                    if self._idle_logged:
+                        self._idle_logged = False
+                        self.after(
+                            0,
+                            lambda: self.append_log("[监控] 检测到用户恢复活动，恢复验证码轮询。"),
+                        )
+
+                result = self.check_code(code_value)
+                if not result:
                     break
-                time.sleep(1)
-        self.monitor_thread_started = False
+
+                self.stop_event.wait(60)
+        finally:
+            self.monitor_thread_started = False
+
 
     def check_code(self, code_value):
         resp = self.client.resolve_code(code_value)
@@ -492,9 +522,10 @@ class App(TkinterDnD.Tk):
                     self.after(0, lambda: self.set_locked(True))
                     self.after(0, lambda: self._set_unlock_button_default())
                     self.after(0, lambda: self.entry_code.config(state="normal"))
+                    self.after(0, lambda: self.entry_code.delete(0, 'end'))
                     return False
         else:
-            self.after(0, lambda: self.append_log("[验证] 失败！服务器故障。"))
+            self.after(0, lambda: self.append_log("[验证] 失败！服务器故障或服务器地址错误。"))
             return False
         return True
 
@@ -506,43 +537,80 @@ class App(TkinterDnD.Tk):
         self.current_code = ""
         self._update_title_status("")
 
-    def upload_file(self, file_path=None):
+    def upload_file(self, file_path=None, override_name=None):
         code_value = self.entry_code.get()
         if file_path:
-            file_name = os.path.basename(file_path)
+            file_name = override_name or os.path.basename(file_path)
             file_size = os.path.getsize(file_path)
             with open(file_path, "rb") as f:
                 resp = self.client.upload_file(code_value, file_name, file_size, f)
         else:
             text_value = self.text_main.get("1.0", "end-1c")
             file_bytes = text_value.encode("utf-8")
-            now_str = datetime.now().strftime("%m%d%H%M%S")
-            file_name = f'文本{now_str}.txt'
+            file_name = override_name or f'文本{get_filename_suffix()}.txt'
             file_size = len(file_bytes)
             file_obj = BytesIO(file_bytes)
             resp = self.client.upload_file(code_value, file_name, file_size, file_obj)
         return resp, file_name
 
     def _upload_async_core(self, file_path=None):
-        resp, file_name = self.upload_file(file_path)
+        self.btn_confirm.config(state="disabled")
+        self.btn_download.config(state="disabled")
+
+        def _next_name(name, n):
+            base, ext = os.path.splitext(name)
+            return f"{base}({n}){ext}"
+
+        if file_path:
+            origin_name = os.path.basename(file_path)
+        else:
+            origin_name = f'文本{get_filename_suffix()}.txt'
+
+        attempt = 0
+        while True:
+            if attempt == 0:
+                override_name = None
+            else:
+                override_name = _next_name(origin_name, attempt)
+
+            resp, file_name = self.upload_file(file_path, override_name=override_name)
+
+            need_retry = False
+            msg = None
+            if resp.status_code == 200:
+                json_data = resp.json()
+                if not json_data.get("success"):
+                    msg = json_data.get("msg")
+                    if msg == "中转上传文件中已存在同名文件":
+                        attempt += 1
+                        need_retry = True
+
+            if need_retry:
+                self.after(0, lambda fn=file_name: self.append_log(f"[上传] 检测到同名，自动更名后重试：{fn}"))
+                continue
+
+            break
 
         def ui_update():
+            self.btn_confirm.config(state="normal")
+            self.btn_download.config(state="normal")
+
             if resp.status_code == 200:
                 json_data = resp.json()
                 if json_data.get('success'):
                     self.append_log(f"[上传] 成功，文件名为「{file_name}」")
                 else:
-                    self.append_log(f"[上传] 失败，{json_data.get('msg')}。")
-                    self.stop_monitor()
+                    msg2 = json_data.get('msg')
+                    self.append_log(f"[上传] 失败，{msg2}。")
+                    if msg2 != "中转上传文件中已存在同名文件":
+                        self.stop_monitor()
             else:
-                self.append_log(f"[上传] 失败！服务器故障。")
+                self.append_log(f"[上传] 失败！服务器故障或服务器地址错误。")
 
         self.after(0, ui_update)
 
-        # 创建后台线程，执行上传任务，防止 UI 阻塞
     def upload_async(self, file_path=None):
-        t = threading.Thread(target=self._upload_async_core, args=(file_path,), daemon=True)
-        t.start()
+        run_async(self._upload_async_core, file_path)
 
     def on_confirm_clicked(self):
         if self.locked:
@@ -592,13 +660,12 @@ class App(TkinterDnD.Tk):
             return
         self.append_log("[下载] 正在查询可下载文件列表...")
 
-        t = threading.Thread(target=self._download_list_async, args=(code_value,), daemon=True)
-        t.start()
+        run_async(self._download_list_async, code_value)
 
     def _download_list_async(self, code_value):
         resp = self.client.get_file_list(code_value)
         if resp.status_code != 200:
-            self.after(0, lambda: self.append_log("[下载] 查询失败！服务器故障。"))
+            self.after(0, lambda: self.append_log("[下载] 查询失败！服务器故障或服务器地址错误。"))
             return
         json_data = resp.json()
         if not json_data.get("success"):
@@ -610,14 +677,46 @@ class App(TkinterDnD.Tk):
             return
 
         self.after(0, lambda: self.show_download_dialog(files))
+        
+    def show_modal(self, win):
+        win.transient(self)
+
+        def _release_grab_if_needed():
+            try:
+                cur = win.grab_current()
+                if cur == win:
+                    win.grab_release()
+            except tk.TclError:
+                pass
+
+        def on_modal_unmap(event=None):
+            _release_grab_if_needed()
+
+        def on_modal_map(event=None):
+            try:
+                win.after(0, lambda: (win.grab_set(), win.lift(), win.focus_force()))
+            except tk.TclError:
+                pass
+
+        win.bind("<Unmap>", on_modal_unmap)
+        win.bind("<Map>", on_modal_map)
+
+        win.deiconify()
+        win.lift()
+        win.focus_force()
+        win.grab_set()
+
+        def on_close():
+            _release_grab_if_needed()
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", on_close)
+        self.wait_window(win)
 
     def show_download_dialog(self, files):
         win = tb.Toplevel(self)
         win.title("选择要下载的文件")
-        win.transient(self)
-        win.grab_set()
         self.update_idletasks()
-
         width, height = 560, 420
         parent_x, parent_y = self.winfo_x(), self.winfo_y()
         parent_w, parent_h = self.winfo_width(), self.winfo_height()
@@ -644,6 +743,12 @@ class App(TkinterDnD.Tk):
             id_name_list.append((file_id, file_name))
             listbox.insert("end", display_text)
 
+        TEXT_EXTENSIONS = {
+            '.txt', '.js', '.html', '.htm', '.py', '.cpp', '.c', '.h', '.hpp',
+            '.css', '.json', '.xml', '.md', '.yaml', '.yml', '.ini', '.cfg', '.sh', '.bat',
+            '.java', '.cs', '.go', '.rs', '.php', '.rb', '.sql', '.log', '.csv'
+        }
+
         btn_frame = tb.Frame(win)
         btn_frame.pack(fill="x", padx=10, pady=(0, 10))
 
@@ -661,22 +766,44 @@ class App(TkinterDnD.Tk):
             if len(selected_ids) == 1:
                 display_name = selected_names[0]
             else:
-                now_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-                display_name = f"选中文件打包_{now_str}.zip"
+                display_name = f"选中文件打包_{get_filename_suffix()}.zip"
 
             self.download_files_async(selected_ids, display_name)
             win.destroy()
 
+        def on_load_to_text():
+            selection = listbox.curselection()
+            if len(selection) != 1:
+                return
+            idx = selection[0]
+            fid, fname = id_name_list[idx]
+            self.load_file_to_text_async(fid, fname)
+            win.destroy()
+
+        def update_load_button_state(event=None):
+            selection = listbox.curselection()
+            if len(selection) == 1:
+                idx = selection[0]
+                _, fname = id_name_list[idx]
+                ext = os.path.splitext(fname)[1].lower()
+                if ext in TEXT_EXTENSIONS:
+                    btn_load_text.config(state="normal")
+                    return
+            btn_load_text.config(state="disabled")
+
         btn_download = tb.Button(btn_frame, text="下载选中文件", bootstyle=SUCCESS, command=on_download_selected)
         btn_download.pack(side=LEFT)
+
+        btn_load_text = tb.Button(btn_frame, text="加载到文本框", bootstyle=PRIMARY, command=on_load_to_text, state="disabled")
+        btn_load_text.pack(side=LEFT, padx=(10, 0))
+
         btn_close = tb.Button(btn_frame, text="关闭", bootstyle=SECONDARY, command=win.destroy)
         btn_close.pack(side=RIGHT)
 
-        # 后台线程下载文件，下载完成后切回主线程更新界面
+        listbox.bind("<<ListboxSelect>>", update_load_button_state)
+        self.show_modal(win)
+
     def download_files_async(self, file_ids, display_name: str):
-        if not file_ids:
-            self.append_log("[下载] 未传入任何文件 ID。")
-            return
 
         def worker():
             ids_str = ",".join(file_ids)
@@ -695,15 +822,46 @@ class App(TkinterDnD.Tk):
                     return
                 try:
                     with open(save_path, "wb") as f:
-                        f.write(resp.content)
+                        for chunk in resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
                     self.append_log(f"[下载] 完成，文件「{display_name}」已保存到：{save_path}")
                 except Exception as e:
                     self.append_log(f"[下载] 保存失败：{e}")
 
             self.after(0, ui_after_resp)
 
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
+        run_async(worker)
+
+    def load_file_to_text_async(self, file_id: str, file_name: str):
+
+        def worker():
+            self.after(0, lambda: self.append_log(f"[加载] 正在加载文件：{file_name} ..."))
+            resp = self.client.download_file(file_id)
+
+            def ui_after_resp():
+                if resp.status_code != 200:
+                    self.append_log(f"[加载] 失败！服务器返回状态码 {resp.status_code}。")
+                    return
+
+                try:
+                    content = resp.content
+                    text = decode_response_content(content)
+                    
+                    if text is None:
+                        self.append_log(f"[加载] 失败：无法解析文件编码。")
+                        return
+
+                    self.text_main.delete("1.0", "end")
+                    self.text_main.insert("1.0", text)
+                    self.append_log(f"[加载] 完成，文件「{file_name}」已加载到文本输入框。")
+
+                except Exception as e:
+                    self.append_log(f"[加载] 失败：{e}")
+
+            self.after(0, ui_after_resp)
+
+        run_async(worker)
 
     def _set_unlock_button_enabled(self, code_value: str):
         self._update_title_status(code_value)
@@ -717,11 +875,8 @@ class App(TkinterDnD.Tk):
             self.btn_unlock.config(text="重置中...", bootstyle=DANGER, state="disabled")
             self.append_log("[验证] 正在重置验证码并锁定界面...")
             self.stop_monitor()
-            try:
-                self.entry_code.config(state="normal")
-                self.entry_code.delete(0, 'end')
-            except Exception:
-                pass
+            self.entry_code.config(state="normal")
+            self.entry_code.delete(0, 'end')
             self.after(300, lambda: self._set_unlock_button_default())
             self.append_log("[验证] 已重置，已恢复到待验证状态。")
         except Exception as e:
