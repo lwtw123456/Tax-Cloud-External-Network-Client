@@ -9,25 +9,24 @@ from ttkbootstrap.icons import Icon
 import tkinter as tk
 from tkinter import filedialog, scrolledtext, messagebox
 from io import BytesIO
-from threading import Event
+from threading import Event, current_thread, main_thread
 import mimetypes
 import requests
 from datetime import datetime
 import configparser
-from utils import is_valid_host, get_filename_suffix, run_async, get_idle_seconds, decode_response_content
+from utils import normalize_host, get_filename_suffix, run_async, get_idle_seconds, decode_response_content
 
 # ============================
 # 网络请求客户端（网络访问层）
 # ============================
 class RequestClient:
-    HOST = ""    # 由配置窗口设置
-    
     def __init__(self, error_handler=None):
+        self.host = ""
         self.error_handler = error_handler
         self.session = requests.Session()
 
     def _build_base_urls(self):
-        base = f"http://{self.HOST}/cloudcenter/conversionNew"
+        base = f"http://{self.host}/cloudcenter/conversionNew"
         return {
             "resolve": f"{base}/resolveCode",
             "upload": f"{base}/uploadFile",
@@ -40,8 +39,8 @@ class RequestClient:
 
     def _build_headers(self, *, x_requested=False, content_type=False):
         headers = {
-            "Origin": f"http://{self.HOST}",
-            "Referer": f"http://{self.HOST}/cloudcenter/nj_home.html",
+            "Origin": f"http://{self.host}",
+            "Referer": f"http://{self.host}/cloudcenter/nj_home.html",
             "accept-language": "zh-CN,zh;q=0.9",
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -57,7 +56,7 @@ class RequestClient:
             
     def safe_request(self, method, url, **kwargs):
         try:
-            resp = self.session.request(method, url, timeout=5, **kwargs)
+            resp = self.session.request(method, url, timeout=(3, 60), **kwargs)
             
             _raw_json = resp.json
 
@@ -80,6 +79,7 @@ class RequestClient:
                     "json": staticmethod(lambda: {}),
                     "content": b"",
                     "iter_content": staticmethod(lambda chunk_size=8192: []),
+                    "error": e
                 },
             )()
 
@@ -309,8 +309,8 @@ class App(TkinterDnD.Tk):
         self.stop_event.set()
         self.destroy()
 
-    def _is_host_configured(self) -> bool:
-        return bool(getattr(self.client, "HOST", "").strip())
+    def _is_host_configured(self):
+        return bool(self.client.host.strip())
 
     def _init_from_config(self):
         config = self.config_manager.load_all()
@@ -322,7 +322,7 @@ class App(TkinterDnD.Tk):
             self.after(200, lambda: self.show_host_config(reason="startup"))
             return
 
-        self.client.HOST = host
+        self.client.host = host
         self.append_log(f"[配置] 已从配置文件读取服务器地址：{host}")
 
         if saved_code and len(saved_code) == 6 and saved_code.isdigit():
@@ -379,7 +379,7 @@ class App(TkinterDnD.Tk):
         entry_host = tb.Entry(frame)
         entry_host.pack(fill=X, pady=(4, 8))
 
-        current_host = getattr(self.client, "HOST", "").strip()
+        current_host = self.client.host.strip()
         if current_host:
             entry_host.insert(0, current_host)
 
@@ -400,12 +400,13 @@ class App(TkinterDnD.Tk):
             if not host:
                 messagebox.showwarning("配置服务器地址", "服务器地址不能为空，请输入一个有效的 HOST。")
                 return
-
-            if not is_valid_host(host):
+                
+            is_valid_host, host = normalize_host(host)
+            if not is_valid_host:
                 messagebox.showwarning("配置服务器地址", "服务器地址格式不正确，请重新输入。")
                 return
 
-            self.client.HOST = host
+            self.client.host = host
             self.config_manager.save_host(host)
             self.append_log(f"[配置] 已设置服务器地址：{host}")
             win.destroy()
@@ -422,7 +423,7 @@ class App(TkinterDnD.Tk):
         btn_cancel.pack(side=RIGHT)
         self.show_modal(win)
 
-    def _validate_code(self, new_value: str) -> bool:
+    def _validate_code(self, new_value):
         if len(new_value) > 6:
             return False
         if new_value == "":
@@ -436,26 +437,41 @@ class App(TkinterDnD.Tk):
                 self.append_log(f"[上传] 选择文件：{os.path.basename(f)}")
                 self.upload_async(f)
 
-    def set_locked(self, locked: bool):
-        self.locked = locked
-        state = "disabled" if locked else "normal"
-        self.btn_confirm.config(state=state)
-        self.btn_download.config(state=state)
-        if locked:
-            self.drop_area.config(text="请先验证验证码以启用拖拽功能", bootstyle="secondary")
-            self._set_unlock_button_default()
-            self._update_title_status("")  # clear code display
+    def set_locked(self, locked):
+        
+        def configure_lock(locked):
+            self.locked = locked
+            state = "disabled" if locked else "normal"
+            self.btn_confirm.config(state=state)
+            self.btn_download.config(state=state)
+            if locked:
+                self.drop_area.config(text="请先验证验证码以启用拖拽功能", bootstyle="secondary")
+                self._set_unlock_button_default()
+                self._update_title_status("")  # clear code display
+            else:
+                self.drop_area.config(text="将文件拖拽到此处（支持多个）", bootstyle="info-subtle")
+            
+        if current_thread() is main_thread():
+            configure_lock(locked)
         else:
-            self.drop_area.config(text="将文件拖拽到此处（支持多个）", bootstyle="info-subtle")
+            self.after(0, lambda: configure_lock(locked))
+            
 
-    def append_log(self, message: str):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.text_log.configure(state="normal")
-        self.text_log.insert("end", f"[{timestamp}] {message}\n")
-        self.text_log.see("end")
-        self.text_log.configure(state="disabled")
-        short = message if len(message) < 80 else message[:77] + "..."
-        self.lbl_status.config(text=short)
+    def append_log(self, message):
+    
+        def write_log(message):
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.text_log.configure(state="normal")
+            self.text_log.insert("end", f"[{timestamp}] {message}\n")
+            self.text_log.see("end")
+            self.text_log.configure(state="disabled")
+            short = message if len(message) < 80 else message[:77] + "..."
+            self.lbl_status.config(text=short)
+            
+        if current_thread() is main_thread():
+            write_log(message)
+        else:
+            self.after(0, lambda: write_log(message))
 
     def _on_request_error(self, exception, url):
         msg = f"网络请求异常：{exception} - {url}"
@@ -486,14 +502,14 @@ class App(TkinterDnD.Tk):
                 if idle_seconds is not None and idle_seconds > self.idle_threshold:
                     if not self._idle_logged:
                         self._idle_logged = True
-                        self.after(0, lambda: self.append_log(f"[监控] 检测到用户已空闲超过 {self.idle_threshold} 秒，暂停验证码轮询。"))
+                        self.append_log(f"[监控] 检测到用户已空闲超过 {self.idle_threshold} 秒，暂停验证码轮询。")
                     if self.stop_event.wait(1):
                         break
                     continue
                 else:
                     if self._idle_logged:
                         self._idle_logged = False
-                        self.after(0, lambda: self.append_log("[监控] 检测到用户恢复活动，恢复验证码轮询。"))
+                        self.append_log("[监控] 检测到用户恢复活动，恢复验证码轮询。")
 
                 result = self.check_code(code_value)
                 if not result:
@@ -510,24 +526,24 @@ class App(TkinterDnD.Tk):
             json_data = resp.json()
             if self.locked:
                 if json_data.get('success'):
-                    self.after(0, lambda: self.set_locked(False))
-                    self.after(0, lambda: self.append_log("[验证] 成功！文本输入框、上传和拖拽区域已启用。"))
+                    self.set_locked(False)
+                    self.append_log("[验证] 成功！文本输入框、上传和拖拽区域已启用。")
                     self.after(0, lambda: self._set_unlock_button_enabled(code_value))
                     self.after(0, lambda: self.entry_code.config(state="readonly"))
                 else:
-                    self.after(0, lambda: self.append_log(f"[验证] 失败：{json_data.get('msg')}"))
+                    self.append_log(f"[验证] 失败：{json_data.get('msg')}")
                     self.after(0, lambda: self.entry_code.delete(0, 'end'))
                     return False
             else:
                 if not json_data.get('success'):
-                    self.after(0, lambda: self.append_log("[验证] 失败！请重新输入验证码。"))
-                    self.after(0, lambda: self.set_locked(True))
+                    self.append_log("[验证] 失败！请重新输入验证码。")
+                    self.set_locked(True)
                     self.after(0, lambda: self._set_unlock_button_default())
                     self.after(0, lambda: self.entry_code.config(state="normal"))
                     self.after(0, lambda: self.entry_code.delete(0, 'end'))
                     return False
         else:
-            self.after(0, lambda: self.append_log("[验证] 失败！服务器故障或服务器地址错误。"))
+            self.append_log("[验证] 失败！服务器故障或服务器地址错误。")
         return True
 
     def stop_monitor(self):
@@ -581,19 +597,21 @@ class App(TkinterDnD.Tk):
             if resp.status_code == 200:
                 json_data = resp.json()
                 if json_data.get('success'):
-                    self.after(0, lambda: self.append_log(f"[上传] 成功，文件名为「{file_name}」"))
+                    self.append_log(f"[上传] 成功，文件名为「{file_name}」")
                 else:
                     msg = json_data.get("msg")
                     if msg == "中转上传文件中已存在同名文件":
                         attempt += 1
                         need_retry = True
+                    elif msg == "上传码已失效":
+                        self.after(0, lambda: self.stop_monitor())
                     else:
                         self.append_log(f"[上传] 失败，{msg}。")
             else:
-                self.after(0, lambda: self.append_log(f"[上传] 失败！服务器故障或服务器地址错误。"))
+                self.append_log(f"[上传] 失败！服务器故障或服务器地址错误。")
 
             if need_retry:
-                self.after(0, lambda fn=file_name: self.append_log(f"[上传] 检测到同名，自动更名后重试：{fn}"))
+                self.append_log(f"[上传] 已存在同名文件{file_name}，自动更名后重试")
                 continue
 
             break
@@ -657,15 +675,15 @@ class App(TkinterDnD.Tk):
     def _download_list_async(self, code_value):
         resp = self.client.get_file_list(code_value)
         if resp.status_code != 200:
-            self.after(0, lambda: self.append_log("[下载] 查询失败！服务器故障或服务器地址错误。"))
+            self.append_log("[下载] 查询失败！服务器故障或服务器地址错误。")
             return
         json_data = resp.json()
         if not json_data.get("success"):
-            self.after(0, lambda: self.append_log("[下载] 当前验证码下没有可下载的文件。"))
+            self.append_log("[下载] 当前验证码下没有可下载的文件。")
             return
         files = json_data.get("data") or []
         if not files:
-            self.after(0, lambda: self.append_log("[下载] 当前验证码下没有可下载的文件。"))
+            self.append_log("[下载] 当前验证码下没有可下载的文件。")
             return
 
         self.after(0, lambda: self.show_download_dialog(files))
@@ -799,7 +817,7 @@ class App(TkinterDnD.Tk):
 
         def worker():
             ids_str = ",".join(file_ids)
-            self.after(0, lambda: self.append_log(f"[下载] 开始下载文件：{display_name} ..."))
+            self.append_log(f"[下载] 开始下载文件：{display_name} ...")
             resp = self.client.download_file(ids_str)
 
             def ui_after_resp():
@@ -828,7 +846,7 @@ class App(TkinterDnD.Tk):
     def load_file_to_text_async(self, file_id: str, file_name: str):
 
         def worker():
-            self.after(0, lambda: self.append_log(f"[加载] 正在加载文件：{file_name} ..."))
+            self.append_log(f"[加载] 正在加载文件：{file_name} ...")
             resp = self.client.download_file(file_id)
 
             def ui_after_resp():
